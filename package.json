@@ -4,9 +4,9 @@
   "description": "Payment Gateway Backend - NestJS",
   "private": true,
   "scripts": {
-    "build": "nest build",
+    "build": "npx nest build",
     "start": "node dist/main",
-    "start:dev": "nest start --watch",
+    "start:dev": "npx nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
     "test:watch": "jest --watch",
