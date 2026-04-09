@@ -4,7 +4,7 @@
   "description": "Payment Gateway Backend - NestJS",
   "private": true,
   "scripts": {
-    "build": "echo 'Build not required — using ts-node'",
+    "build": "mkdir -p dist && echo 'ts-node runtime' > dist/.ready",
     "start": "node app.js",
     "start:dev": "npx nest start --watch",
     "start:prod": "node app.js",
