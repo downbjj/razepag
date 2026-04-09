@@ -4,8 +4,6 @@ import {
   BadRequestException,
   NotFoundException,
 } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import { Queue } from 'bull';
 import { ConfigService } from '@nestjs/config';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../prisma/prisma.service';
@@ -25,7 +23,6 @@ export class PixService {
     private mpProvider: MercadoPagoProvider,
     private webhooksService: WebhooksService,
     private configService: ConfigService,
-    @InjectQueue('pix') private pixQueue: Queue,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -35,12 +32,10 @@ export class PixService {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException('Usuário não encontrado');
 
-    // externalId = nosso UUID que vai como external_reference no MP
     const externalId = uuidv4();
     const fee        = this.calculateFee(dto.amount);
     const netAmount  = parseFloat((dto.amount - fee).toFixed(2));
 
-    // Cria transação PENDING antes de chamar o MP
     const transaction = await this.prisma.transaction.create({
       data: {
         userId,
@@ -55,7 +50,6 @@ export class PixService {
     });
 
     try {
-      // Chama Mercado Pago para gerar o QR Code
       const charge = await this.mpProvider.createPixCharge({
         externalId,
         amount:        dto.amount,
@@ -64,13 +58,11 @@ export class PixService {
         customerEmail: user.email,
       });
 
-      // Salva o payment ID do MP no metadata (para referência futura)
       await this.prisma.transaction.update({
         where: { id: transaction.id },
         data:  { metadata: { mpPaymentId: charge.id, mpStatus: charge.status } },
       });
 
-      // Cria registro Pix 1:1
       await this.prisma.pix.create({
         data: {
           transactionId: transaction.id,
@@ -80,28 +72,22 @@ export class PixService {
         },
       });
 
-      // Log
       await this.prisma.log.create({
         data: {
           type:    'SYSTEM',
-          message: `Cobrança PIX criada: R$${dto.amount} | user=${user.email} | ext=${externalId} | mp=${charge.id}`,
+          message: `Cobrança PIX criada: R$${dto.amount} | user=${user.email} | ext=${externalId}`,
           data:    { transactionId: transaction.id, externalId, mpPaymentId: charge.id },
         },
       });
 
-      // Polling de fallback (caso o webhook não chegue)
-      await this.pixQueue.add(
-        'poll-payment',
-        { transactionId: transaction.id, externalId, userId, attempts: 0 },
-        { delay: 15000, attempts: 24, backoff: { type: 'fixed', delay: 30000 } },
-      );
+      // Polling de fallback via setTimeout (sem Redis)
+      this.schedulePollPayment(transaction.id, externalId, userId, 24, 0, 15000);
 
       return this.prisma.transaction.findUnique({
         where:   { id: transaction.id },
         include: { pix: true },
       });
     } catch (error) {
-      // Cancela a transação se o MP falhou
       await this.prisma.transaction.update({
         where: { id: transaction.id },
         data:  { status: 'FAILED' },
@@ -145,11 +131,8 @@ export class PixService {
 
     await this.walletService.debit(userId, totalDebit);
 
-    await this.pixQueue.add(
-      'send-transfer',
-      { transactionId: transaction.id, externalId, userId, pixKey: dto.pixKey, amount: dto.amount },
-      { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
-    );
+    // Executa a transferência de forma assíncrona com retry
+    this.executeTransfer(transaction.id, externalId, userId, dto.pixKey, dto.amount, 0, 3);
 
     return transaction;
   }
@@ -219,39 +202,22 @@ export class PixService {
     });
 
     await Promise.allSettled([
-      this.webhooksService.triggerWebhook(senderId, 'transfer.completed', {
-        type: 'TRANSFER', amount, fee, recipient: recipient.email,
-      }),
-      this.webhooksService.triggerWebhook(recipient.id, 'transfer.received', {
-        type: 'TRANSFER', amount, sender: sender.email,
-      }),
+      this.webhooksService.triggerWebhook(senderId,     'transfer.completed', { type: 'TRANSFER', amount, fee, recipient: recipient.email }),
+      this.webhooksService.triggerWebhook(recipient.id, 'transfer.received',  { type: 'TRANSFER', amount, sender: sender.email }),
     ]);
 
     return { success: true, amount, fee, recipient: { name: recipient.name, email: recipient.email } };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // WEBHOOK MERCADO PAGO — FLUXO CORRETO E SEGURO
-  //
-  // 1. Recebe notificação
-  // 2. Extrai APENAS o payment ID (não confia em nada mais)
-  // 3. Consulta a API do MP para obter o status real
-  // 4. Valida status === 'approved'
-  // 5. Busca transação pelo external_reference
-  // 6. Verifica duplicidade (idempotência atômica)
-  // 7. Calcula taxa e credita saldo dentro de $transaction
+  // WEBHOOK MERCADO PAGO
   // ─────────────────────────────────────────────────────────────────────────
   async handleMercadoPagoWebhook(payload: any): Promise<{ received: boolean }> {
-    // Loga o webhook recebido
     this.logger.log(`MP webhook recebido: ${JSON.stringify(payload).slice(0, 300)}`);
 
-    // Ignora notificações que não sejam de pagamento
     const type = payload?.type || payload?.topic;
-    if (type && type !== 'payment') {
-      return { received: true };
-    }
+    if (type && type !== 'payment') return { received: true };
 
-    // Extrai o MP payment ID — ÚNICA informação que usamos do body
     const mpPaymentId = String(
       payload?.data?.id ||
       payload?.resource?.split('/').pop() ||
@@ -263,7 +229,6 @@ export class PixService {
       return { received: true };
     }
 
-    // Salva log do webhook
     await this.prisma.log.create({
       data: {
         type:    'WEBHOOK',
@@ -272,48 +237,29 @@ export class PixService {
       },
     }).catch(() => {});
 
-    // SEMPRE consulta a API do MP — nunca confia no status do body
     const payment = await this.mpProvider.getPayment(mpPaymentId);
+    if (!payment) return { received: true };
 
-    if (!payment) {
-      this.logger.warn(`Payment ${mpPaymentId} não encontrado na API do MP`);
-      return { received: true };
-    }
+    this.logger.log(`Payment ${mpPaymentId}: status=${payment.status}`);
 
-    this.logger.log(`Payment ${mpPaymentId}: status=${payment.status} | ext_ref=${payment.external_reference}`);
-
-    // Ignora se não está aprovado
     if (payment.status !== 'approved') {
-      if (payment.status === 'rejected' || payment.status === 'cancelled') {
-        // Cancela a transação local se existir
-        if (payment.external_reference) {
-          await this.prisma.transaction.updateMany({
-            where: { externalId: payment.external_reference, status: 'PENDING' },
-            data:  { status: 'CANCELLED' },
-          });
-        }
+      if ((payment.status === 'rejected' || payment.status === 'cancelled') && payment.external_reference) {
+        await this.prisma.transaction.updateMany({
+          where: { externalId: payment.external_reference, status: 'PENDING' },
+          data:  { status: 'CANCELLED' },
+        });
       }
       return { received: true };
     }
 
-    // Valida external_reference (nosso UUID)
-    const externalReference = payment.external_reference;
-    if (!externalReference) {
-      this.logger.warn(`Payment ${mpPaymentId} sem external_reference`);
-      return { received: true };
-    }
+    if (!payment.external_reference) return { received: true };
 
-    // Busca nossa transação
     const transaction = await this.prisma.transaction.findUnique({
-      where: { externalId: externalReference },
+      where: { externalId: payment.external_reference },
     });
 
-    if (!transaction) {
-      this.logger.warn(`Transação não encontrada para externalId=${externalReference}`);
-      return { received: true };
-    }
+    if (!transaction) return { received: true };
 
-    // Confirma o depósito de forma atômica (previne duplicidade por race condition)
     await this.confirmDepositAtomic(
       transaction.id,
       transaction.userId,
@@ -327,9 +273,6 @@ export class PixService {
 
   // ─────────────────────────────────────────────────────────────────────────
   // CONFIRMAR DEPÓSITO — ATÔMICO E IDEMPOTENTE
-  //
-  // Usa updateMany com WHERE status=PENDING para garantir que apenas
-  // um processo execute mesmo sob concorrência (webhooks + polling)
   // ─────────────────────────────────────────────────────────────────────────
   async confirmDepositAtomic(
     transactionId: string,
@@ -341,54 +284,37 @@ export class PixService {
     const metadata: any = mpPaymentId ? { mpPaymentId, confirmedAt: new Date().toISOString() } : {};
 
     await this.prisma.$transaction(async (tx) => {
-      // Atualiza APENAS se ainda estiver PENDING (idempotência atômica)
       const updated = await tx.transaction.updateMany({
         where: { id: transactionId, status: 'PENDING' },
-        data: {
-          status:   'PAID',
-          fee,
-          netAmount,
-          metadata,
-        },
+        data:  { status: 'PAID', fee, netAmount, metadata },
       });
 
-      // Se nenhuma linha foi atualizada, já foi processada — aborta
       if (updated.count === 0) {
         this.logger.log(`Transação ${transactionId} já processada — idempotência ativa`);
         return;
       }
 
-      // Credita saldo do usuário
       await tx.user.update({
         where: { id: userId },
-        data: {
-          balance:        { increment: netAmount },
-          totalDeposited: { increment: netAmount },
-        },
+        data:  { balance: { increment: netAmount }, totalDeposited: { increment: netAmount } },
       });
     });
 
-    // Aciona webhook do usuário (fora da $transaction para não travar)
     this.webhooksService.triggerWebhook(userId, 'payment.completed', {
-      transactionId,
-      netAmount,
-      fee,
-      mpPaymentId,
+      transactionId, netAmount, fee, mpPaymentId,
     }).catch(() => {});
 
-    // Log de confirmação
     await this.prisma.log.create({
       data: {
         type:    'SYSTEM',
-        message: `Depósito confirmado: transactionId=${transactionId} | userId=${userId} | R$${netAmount} creditado`,
+        message: `Depósito confirmado: ${transactionId} | R$${netAmount} creditado`,
         data:    { transactionId, userId, netAmount, fee, mpPaymentId },
       },
     }).catch(() => {});
 
-    this.logger.log(`✅ Depósito confirmado: ${transactionId} — R$${netAmount} creditado para ${userId}`);
+    this.logger.log(`✅ Depósito confirmado: ${transactionId} — R$${netAmount} para ${userId}`);
   }
 
-  // Alias legado
   async confirmDeposit(transactionId: string, userId: string, netAmount: number): Promise<void> {
     const transaction = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
     if (!transaction) return;
@@ -399,9 +325,6 @@ export class PixService {
     return this.confirmDeposit(transactionId, userId, netAmount);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // WEBHOOK LEGADO (compatibilidade)
-  // ─────────────────────────────────────────────────────────────────────────
   async handleWebhookFromProvider(payload: any) {
     const { event, payment } = payload;
     if (!payment?.externalReference) return;
@@ -413,10 +336,8 @@ export class PixService {
 
     if (event === 'PAYMENT_RECEIVED' || event === 'PAYMENT_CONFIRMED') {
       await this.confirmDepositAtomic(
-        transaction.id,
-        transaction.userId,
-        transaction.fee.toNumber(),
-        transaction.netAmount.toNumber(),
+        transaction.id, transaction.userId,
+        transaction.fee.toNumber(), transaction.netAmount.toNumber(),
       );
     } else if (event === 'PAYMENT_OVERDUE' || event === 'PAYMENT_DELETED') {
       await this.prisma.transaction.updateMany({
@@ -430,19 +351,13 @@ export class PixService {
   // CONSULTAR TRANSAÇÕES
   // ─────────────────────────────────────────────────────────────────────────
   async getTransactions(userId: string, page = 1, limit = 20, type?: string, status?: string) {
-    const skip        = (page - 1) * limit;
-    const where: any  = { userId };
+    const skip       = (page - 1) * limit;
+    const where: any = { userId };
     if (type)   where.type   = type;
     if (status) where.status = status;
 
     const [transactions, total] = await Promise.all([
-      this.prisma.transaction.findMany({
-        where,
-        include: { pix: true },
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-      }),
+      this.prisma.transaction.findMany({ where, include: { pix: true }, orderBy: { createdAt: 'desc' }, skip, take: limit }),
       this.prisma.transaction.count({ where }),
     ]);
 
@@ -451,19 +366,91 @@ export class PixService {
 
   async getTransaction(userId: string, transactionId: string) {
     const transaction = await this.prisma.transaction.findFirst({
-      where:   { id: transactionId, userId },
-      include: { pix: true },
+      where: { id: transactionId, userId }, include: { pix: true },
     });
     if (!transaction) throw new NotFoundException('Transação não encontrada');
     return transaction;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // CÁLCULO DE TAXA: 3% + R$1,00
-  // ─────────────────────────────────────────────────────────────────────────
   calculateFee(amount: number): number {
     const pct  = parseFloat(this.configService.get('PIX_FEE_PERCENTAGE', '3'));
     const flat = parseFloat(this.configService.get('PIX_FEE_FLAT',       '1.00'));
     return parseFloat((amount * (pct / 100) + flat).toFixed(2));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // POLLING SEM REDIS — usa setTimeout com retry exponencial
+  // ─────────────────────────────────────────────────────────────────────────
+  private schedulePollPayment(
+    transactionId: string, externalId: string, userId: string,
+    maxAttempts: number, attempt: number, delay: number,
+  ) {
+    setTimeout(async () => {
+      try {
+        const transaction = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+        if (!transaction || transaction.status !== 'PENDING') return;
+
+        const status = await this.mpProvider.getPaymentStatus(externalId);
+
+        if (status === 'approved') {
+          await this.confirmDepositAtomic(
+            transactionId, userId,
+            transaction.fee.toNumber(), transaction.netAmount.toNumber(),
+          );
+          this.logger.log(`Poll: pagamento confirmado via polling: ${transactionId}`);
+        } else if (status === 'rejected' || status === 'cancelled') {
+          await this.prisma.transaction.updateMany({
+            where: { id: transactionId, status: 'PENDING' },
+            data:  { status: 'CANCELLED' },
+          });
+        } else if (attempt < maxAttempts - 1) {
+          this.schedulePollPayment(transactionId, externalId, userId, maxAttempts, attempt + 1, 30000);
+        }
+      } catch (err) {
+        this.logger.error(`Poll error for ${transactionId}: ${err.message}`);
+        if (attempt < maxAttempts - 1) {
+          this.schedulePollPayment(transactionId, externalId, userId, maxAttempts, attempt + 1, 30000);
+        }
+      }
+    }, delay);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TRANSFERÊNCIA PIX SEM REDIS — executa direto com retry exponencial
+  // ─────────────────────────────────────────────────────────────────────────
+  private async executeTransfer(
+    transactionId: string, externalId: string, userId: string,
+    pixKey: string, amount: number, attempt: number, maxAttempts: number,
+  ) {
+    try {
+      const result = await this.mpProvider.sendPixTransfer({ pixKey, amount, externalId });
+      await this.prisma.transaction.update({
+        where: { id: transactionId },
+        data:  { status: result.status === 'approved' ? 'PAID' : 'PROCESSING', metadata: { mpTransferId: result.id } },
+      });
+      this.logger.log(`PIX enviado: ${transactionId} → ${pixKey}`);
+    } catch (error) {
+      this.logger.error(`Erro na transferência PIX ${transactionId}: ${error.message}`);
+
+      if (attempt < maxAttempts - 1) {
+        const delay = Math.pow(2, attempt) * 5000;
+        setTimeout(() => this.executeTransfer(transactionId, externalId, userId, pixKey, amount, attempt + 1, maxAttempts), delay);
+      } else {
+        // Estorno após esgotar tentativas
+        await this.prisma.$transaction(async (tx) => {
+          const t = await tx.transaction.findUnique({ where: { id: transactionId } });
+          if (!t) return;
+          await tx.transaction.update({ where: { id: transactionId }, data: { status: 'FAILED' } });
+          const refund = parseFloat((t.amount.toNumber() + t.fee.toNumber()).toFixed(2));
+          await tx.user.update({
+            where: { id: userId },
+            data:  { balance: { increment: refund }, totalWithdrawn: { decrement: refund } },
+          });
+        });
+        await this.prisma.log.create({
+          data: { type: 'ERROR', message: `Falha ao enviar PIX ${transactionId}: ${error.message}`, data: { transactionId, userId, pixKey, amount } },
+        }).catch(() => {});
+      }
+    }
   }
 }

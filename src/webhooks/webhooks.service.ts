@@ -1,8 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { InjectQueue } from '@nestjs/bull';
-import { Queue } from 'bull';
 import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
+import axios from 'axios';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateWebhookDto } from './dto/create-webhook.dto';
 
@@ -10,10 +9,7 @@ import { CreateWebhookDto } from './dto/create-webhook.dto';
 export class WebhooksService {
   private readonly logger = new Logger(WebhooksService.name);
 
-  constructor(
-    private prisma: PrismaService,
-    @InjectQueue('webhooks') private webhooksQueue: Queue,
-  ) {}
+  constructor(private prisma: PrismaService) {}
 
   async createWebhook(userId: string, dto: CreateWebhookDto) {
     const secret = crypto.randomBytes(32).toString('hex');
@@ -104,26 +100,92 @@ export class WebhooksService {
         },
       });
 
-      await this.webhooksQueue.add(
-        'send',
-        {
-          logId: log.id,
-          webhookId: webhook.id,
-          url: webhook.url,
-          secret: webhook.secret,
-          payload: fullPayload,
-          attempt: 1,
-        },
-        {
-          attempts: 5,
-          backoff: { type: 'exponential', delay: 5000 },
-          removeOnComplete: false,
-        },
-      );
+      // Fire-and-forget with retry via setTimeout
+      this.sendWebhookWithRetry({
+        logId: log.id,
+        url: webhook.url,
+        secret: webhook.secret,
+        payload: fullPayload,
+        attempt: 1,
+        maxAttempts: 5,
+      });
     }
   }
 
   generateSignature(payload: string, secret: string): string {
     return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  }
+
+  private sendWebhookWithRetry(opts: {
+    logId: string;
+    url: string;
+    secret: string;
+    payload: any;
+    attempt: number;
+    maxAttempts: number;
+  }) {
+    const { logId, url, secret, payload, attempt, maxAttempts } = opts;
+    const payloadStr = JSON.stringify(payload);
+    const signature = crypto.createHmac('sha256', secret).update(payloadStr).digest('hex');
+
+    axios
+      .post(url, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Webhook-Signature': `sha256=${signature}`,
+          'X-Webhook-Event': payload.event,
+          'User-Agent': 'PaymentGateway-Webhook/1.0',
+        },
+        timeout: 10000,
+      })
+      .then(async (response) => {
+        await this.prisma.webhookLog.update({
+          where: { id: logId },
+          data: {
+            responseStatus: response.status,
+            responseBody: JSON.stringify(response.data).substring(0, 1000),
+            success: true,
+            attempts: attempt,
+          },
+        });
+        this.logger.log(`Webhook delivered: ${logId} -> ${url} [${response.status}]`);
+      })
+      .catch(async (error) => {
+        const status = error.response?.status;
+        const body = error.response?.data
+          ? JSON.stringify(error.response.data).substring(0, 500)
+          : error.message;
+
+        const nextRetryDelay = Math.pow(2, attempt - 1) * 5000; // 5s, 10s, 20s, 40s, 80s
+
+        await this.prisma.webhookLog
+          .update({
+            where: { id: logId },
+            data: {
+              responseStatus: status || 0,
+              responseBody: body,
+              success: false,
+              attempts: attempt,
+              nextRetryAt:
+                attempt < maxAttempts ? new Date(Date.now() + nextRetryDelay) : null,
+            },
+          })
+          .catch(() => {});
+
+        this.logger.warn(
+          `Webhook failed: ${logId} -> ${url} [${status || 'no response'}] - attempt ${attempt}/${maxAttempts}`,
+        );
+
+        if (attempt < maxAttempts) {
+          setTimeout(() => {
+            this.sendWebhookWithRetry({
+              ...opts,
+              attempt: attempt + 1,
+            });
+          }, nextRetryDelay);
+        } else {
+          this.logger.error(`Webhook permanently failed after ${maxAttempts} attempts: ${logId}`);
+        }
+      });
   }
 }

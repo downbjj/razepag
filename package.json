@@ -6,12 +6,16 @@
   "scripts": {
     "build": "mkdir -p dist && echo 'ts-node runtime' > dist/.ready",
     "start": "node app.js",
-    "start:dev": "npx nest start --watch",
+    "start:dev": "ts-node -r tsconfig-paths/register src/main.ts",
     "start:prod": "node app.js",
     "test": "jest",
+    "test:watch": "jest --watch",
+    "test:cov": "jest --coverage",
     "prisma:generate": "prisma generate",
-    "prisma:seed": "./node_modules/.bin/ts-node prisma/seed.ts",
-    "postinstall": "prisma generate"
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:push": "prisma db push",
+    "prisma:seed": "ts-node prisma/seed.ts",
+    "postinstall": "prisma generate || true"
   },
   "jest": {
     "moduleFileExtensions": ["js","json","ts"],
@@ -34,44 +38,38 @@
     "@nestjs/platform-express": "^10.3.0",
     "@nestjs/swagger": "^7.3.0",
     "@nestjs/throttler": "^5.1.2",
-    "@nestjs/bull": "^10.1.1",
     "@prisma/client": "^5.10.0",
+    "@types/node": "^20.11.17",
     "axios": "^1.6.7",
     "bcryptjs": "^2.4.3",
-    "bull": "^4.12.2",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "compression": "^1.7.4",
     "helmet": "^7.1.0",
-    "ioredis": "^5.3.2",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
-    "nodemailer": "^6.9.9",
+    "prisma": "^5.10.0",
     "qrcode": "^1.5.3",
     "reflect-metadata": "^0.2.1",
     "rxjs": "^7.8.1",
-    "uuid": "^9.0.1",
+    "ts-node": "^10.9.2",
     "typescript": "^5.3.3",
-    "@types/node": "^20.11.17",
-    "ts-node": "^10.9.2"
+    "uuid": "^9.0.1"
   },
   "prisma": {
-    "seed": "./node_modules/.bin/ts-node prisma/seed.ts"
+    "seed": "ts-node prisma/seed.ts"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.2",
     "@nestjs/schematics": "^10.1.1",
     "@nestjs/testing": "^10.3.0",
     "@types/bcryptjs": "^2.4.6",
-    "@types/bull": "^4.10.0",
     "@types/compression": "^1.7.5",
     "@types/jest": "^29.5.12",
     "@types/passport-jwt": "^4.0.1",
-    "@types/nodemailer": "^6.4.14",
     "@types/qrcode": "^1.5.5",
     "@types/uuid": "^9.0.8",
     "jest": "^29.7.0",
-    "prisma": "^5.10.0",
     "ts-jest": "^29.1.2"
   }
 }

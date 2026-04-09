@@ -22,7 +22,6 @@ import { PrismaService } from '../../prisma/prisma.service'
 import { WalletService } from '../../wallet/wallet.service'
 import { MercadoPagoProvider } from '../providers/mercadopago.provider'
 import { WebhooksService } from '../../webhooks/webhooks.service'
-import { getQueueToken } from '@nestjs/bull'
 
 // ─── Factories ───────────────────────────────────────────────────────────────
 
@@ -113,10 +112,6 @@ const mockWebhooksService = {
   triggerWebhook: jest.fn().mockResolvedValue(undefined),
 }
 
-const mockPixQueue = {
-  add: jest.fn().mockResolvedValue(undefined),
-}
-
 const mockConfigService = {
   get: (key: string, fallback?: string) => {
     const cfg: Record<string, string> = {
@@ -143,7 +138,6 @@ describe('PixService', () => {
         { provide: WalletService,        useValue: mockWalletService },
         { provide: WebhooksService,      useValue: mockWebhooksService },
         { provide: ConfigService,        useValue: mockConfigService },
-        { provide: getQueueToken('pix'), useValue: mockPixQueue },
       ],
     }).compile()
 
@@ -223,13 +217,12 @@ describe('PixService', () => {
       )
     })
 
-    it('agenda polling de fallback na fila', async () => {
+    it('agenda polling de fallback via setTimeout', async () => {
+      jest.useFakeTimers()
       await service.createCharge('user-abc-123', { amount: 100 })
-      expect(mockPixQueue.add).toHaveBeenCalledWith(
-        'poll-payment',
-        expect.objectContaining({ userId: 'user-abc-123' }),
-        expect.any(Object),
-      )
+      // schedulePollPayment uses setTimeout — verify it was scheduled
+      expect(jest.getTimerCount()).toBeGreaterThan(0)
+      jest.useRealTimers()
     })
 
     it('lança erro se usuário não existe', async () => {
