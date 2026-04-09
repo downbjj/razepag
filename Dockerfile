@@ -1,18 +1,3 @@
-FROM node:20-alpine AS builder
-
-WORKDIR /app
-
-COPY package*.json tsconfig*.json ./
-COPY prisma ./prisma
-
-RUN npm install
-
-COPY src ./src
-
-# Compila com tsc (sem depender do nest CLI)
-RUN npm run build
-
-# ─── Produção ────────────────────────────────────────────────
 FROM node:20-alpine AS production
 
 RUN apk add --no-cache dumb-init openssl libc6-compat
@@ -21,17 +6,16 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
-COPY package*.json ./
+COPY package*.json tsconfig*.json ./
 COPY prisma ./prisma
+COPY src ./src
+COPY app.js ./
 
-RUN npm install --omit=dev --ignore-scripts && \
-    npm install prisma @prisma/client --ignore-scripts && \
+RUN npm install --ignore-scripts && \
     ./node_modules/.bin/prisma generate && \
     npm cache clean --force
-
-COPY --from=builder /app/dist ./dist
 
 EXPOSE 3001
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "./node_modules/.bin/prisma db push --schema=prisma/schema.prisma && node dist/src/main.js"]
+CMD ["sh", "-c", "./node_modules/.bin/prisma db push --schema=prisma/schema.prisma && node app.js"]
