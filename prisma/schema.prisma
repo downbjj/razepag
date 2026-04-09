@@ -1,0 +1,535 @@
+// ============================================================
+// RAZEPAG — Prisma Schema
+// PostgreSQL · UUID · Decimal para valores financeiros
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+  OWNER
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING
+  FROZEN
+  SUSPENDED
+}
+
+enum TransactionType {
+  DEPOSIT    // Receber PIX (entrada)
+  WITHDRAW   // Sacar / Enviar PIX (saída)
+  TRANSFER   // Transferência interna entre usuários
+  ADJUSTMENT // Ajuste manual pelo admin
+}
+
+enum TransactionStatus {
+  PENDING    // Aguardando confirmação
+  PAID       // Confirmado e creditado
+  FAILED     // Falhou
+  PROCESSING // Em processamento
+  CANCELLED  // Cancelado
+}
+
+enum LogType {
+  WEBHOOK
+  ERROR
+  SYSTEM
+}
+
+enum DocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum PopupStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CryptoWithdrawalStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  REJECTED
+}
+
+// ─────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────
+
+model User {
+  id        String     @id @default(uuid())
+  name      String
+  email     String     @unique
+  password  String
+  phone     String?
+  pixKey    String?    @unique
+  role      Role       @default(USER)
+  status    UserStatus @default(ACTIVE)
+  isBlocked Boolean    @default(false)
+
+  // Saldo direto no usuário — Decimal para precisão financeira
+  balance        Decimal @default(0) @db.Decimal(20, 2)
+  pendingBalance Decimal @default(0) @db.Decimal(20, 2)
+  totalDeposited Decimal @default(0) @db.Decimal(20, 2)
+  totalWithdrawn Decimal @default(0) @db.Decimal(20, 2)
+
+  // Gateway — token MP armazenado com criptografia AES-256
+  mercadoPagoAccessToken String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions        Transaction[]
+  apiClients          ApiClient[]
+  webhooks            WebhookConfig[]
+  webhookLogs         WebhookLog[]
+  auditLogs           AuditLog[]
+  refreshTokens       RefreshToken[]
+  documents           Document[]
+  purchases           Purchase[]
+  feeConfig           UserFeeConfig?
+  cryptoWithdrawals   CryptoWithdrawal[]
+  notifications       NotificationLog[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([email])
+  @@index([status])
+  @@index([role])
+}
+
+// ApiKey model removed — replaced by ApiClient (client_id + client_secret)
+
+// ─────────────────────────────────────────
+// TRANSACTIONS
+// ─────────────────────────────────────────
+
+model Transaction {
+  id            String            @id @default(uuid())
+  userId        String
+  user          User              @relation(fields: [userId], references: [id])
+  type          TransactionType
+  status        TransactionStatus @default(PENDING)
+
+  // Valores financeiros — taxa: 3% + R$1,00
+  amount    Decimal @db.Decimal(20, 2)
+  fee       Decimal @default(0) @db.Decimal(20, 2)
+  netAmount Decimal @db.Decimal(20, 2)
+
+  description   String?
+  externalId    String? @unique   // ID no provedor (Mercado Pago, etc.)
+  pixKey        String?           // Chave PIX de destino (para WITHDRAW)
+  relatedUserId String?           // Para TRANSFER: ID do outro usuário
+  metadata      Json?             // Dados extras do provedor
+
+  pix Pix?  // Dados do QR Code (1:1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@index([externalId])
+}
+
+// ─────────────────────────────────────────
+// PIX (QR Code / Copia e Cola)
+// Relacionamento 1:1 com Transaction
+// ─────────────────────────────────────────
+
+model Pix {
+  id            String      @id @default(uuid())
+  transactionId String      @unique
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  qrCode    String?  @db.Text  // base64 da imagem QR
+  copyPaste String?  @db.Text  // string copia e cola
+  expiresAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([transactionId])
+}
+
+// ─────────────────────────────────────────
+// LOGS (Webhook / Error / System)
+// ─────────────────────────────────────────
+
+model Log {
+  id        String   @id @default(uuid())
+  type      LogType
+  message   String
+  data      Json?    // Payload completo do evento
+
+  createdAt DateTime @default(now())
+
+  @@index([type])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// WEBHOOK CONFIG (por usuário)
+// ─────────────────────────────────────────
+
+model WebhookConfig {
+  id       String   @id @default(uuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  url      String
+  events   String[]
+  isActive Boolean  @default(true)
+  secret   String   // HMAC-SHA256 secret
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────
+// WEBHOOK LOG (histórico de envios)
+// ─────────────────────────────────────────
+
+model WebhookLog {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  webhookId      String
+  event          String
+  payload        Json
+  responseStatus Int?
+  responseBody   String?   @db.Text
+  attempts       Int       @default(1)
+  success        Boolean   @default(false)
+  nextRetryAt    DateTime?
+  transactionId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([webhookId])
+  @@index([transactionId])
+}
+
+// ─────────────────────────────────────────
+// SYSTEM CONFIG (configurações do sistema)
+// ─────────────────────────────────────────
+
+model SystemConfig {
+  id          String  @id @default(uuid())
+  key         String  @unique
+  value       String
+  description String?
+  group       String? @default("general")
+
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────
+// AUDIT LOG (ações administrativas)
+// ─────────────────────────────────────────
+
+model AuditLog {
+  id        String  @id @default(uuid())
+  userId    String?
+  user      User?   @relation(fields: [userId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  oldValues Json?
+  newValues Json?
+  ipAddress String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// REFRESH TOKENS (JWT)
+// ─────────────────────────────────────────
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  isRevoked Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([token])
+}
+
+// ─────────────────────────────────────────
+// KYC DOCUMENTS
+// ─────────────────────────────────────────
+
+model Document {
+  id          String         @id @default(uuid())
+  userId      String
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        String         // CPF, CNPJ, RG, CNH, SELFIE, etc.
+  fileUrl     String
+  fileName    String?
+  status      DocumentStatus @default(PENDING)
+  reviewedBy  String?
+  reviewNote  String?        @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────
+// PRODUCTS & CATEGORIES
+// ─────────────────────────────────────────
+
+model Category {
+  id          String    @id @default(uuid())
+  name        String    @unique
+  description String?
+  slug        String    @unique
+  isActive    Boolean   @default(true)
+
+  products  Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Product {
+  id          String        @id @default(uuid())
+  name        String
+  description String?       @db.Text
+  price       Decimal       @db.Decimal(20, 2)
+  status      ProductStatus @default(ACTIVE)
+  categoryId  String?
+  category    Category?     @relation(fields: [categoryId], references: [id])
+  imageUrl    String?
+  sku         String?       @unique
+  stock       Int?
+  metadata    Json?
+
+  purchases Purchase[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categoryId])
+  @@index([status])
+}
+
+model Purchase {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  quantity  Int      @default(1)
+  amount    Decimal  @db.Decimal(20, 2)
+  status    String   @default("PENDING")
+  notes     String?
+  metadata  Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([productId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────
+// POPUPS
+// ─────────────────────────────────────────
+
+model Popup {
+  id       String      @id @default(uuid())
+  title    String
+  content  String      @db.Text
+  imageUrl String?
+  link     String?
+  status   PopupStatus @default(ACTIVE)
+  startAt  DateTime?
+  endAt    DateTime?
+  priority Int         @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ─────────────────────────────────────────
+// USER FEE CONFIG (taxas personalizadas)
+// ─────────────────────────────────────────
+
+model UserFeeConfig {
+  id         String  @id @default(uuid())
+  userId     String  @unique
+  user       User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  feePercent Decimal @default(3.00) @db.Decimal(5, 2)
+  feeFixed   Decimal @default(1.00) @db.Decimal(10, 2)
+  notes      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────
+// CRYPTO WITHDRAWALS
+// ─────────────────────────────────────────
+
+model CryptoWithdrawal {
+  id        String                 @id @default(uuid())
+  userId    String
+  user      User                   @relation(fields: [userId], references: [id])
+  amount    Decimal                @db.Decimal(20, 8)
+  currency  String
+  address   String
+  network   String?
+  status    CryptoWithdrawalStatus @default(PENDING)
+  txHash    String?
+  adminNote String?                @db.Text
+  reviewedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────
+
+model NotificationLog {
+  id        String    @id @default(uuid())
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id])
+  title     String
+  message   String    @db.Text
+  type      String    @default("INFO")   // INFO, WARNING, SUCCESS, ERROR
+  sentBy    String?
+  readAt    DateTime?
+  isBroadcast Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// PASSWORD RESET TOKENS
+// ─────────────────────────────────────────
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  used      Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([token])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────
+// EMAIL LOG
+// ─────────────────────────────────────────
+
+model EmailLog {
+  id        String   @id @default(uuid())
+  to        String
+  subject   String
+  body      String   @db.Text
+  status    String   @default("SENT")
+  sentBy    String?
+  errorMsg  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([to])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────
+// API CLIENT CREDENTIALS (Gateway)
+// Cada user pode ter múltiplas credenciais
+// ─────────────────────────────────────────
+
+model ApiClient {
+  id           String   @id @default(uuid())
+  clientId     String   @unique
+  clientSecret String   // bcrypt hash — nunca retornar após criação
+  name         String
+  allowedIps   String[] @default([])
+  isActive     Boolean  @default(true)
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  requestLogs GatewayRequestLog[]
+
+  @@index([clientId])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────
+// GATEWAY REQUEST LOG
+// ─────────────────────────────────────────
+
+model GatewayRequestLog {
+  id           String    @id @default(uuid())
+  apiClientId  String
+  apiClient    ApiClient @relation(fields: [apiClientId], references: [id], onDelete: Cascade)
+  endpoint     String
+  method       String    @default("POST")
+  ip           String
+  statusCode   Int?
+  responseTime Int?      // milliseconds
+  error        String?   @db.Text
+  requestBody  Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([apiClientId])
+  @@index([createdAt])
+}
