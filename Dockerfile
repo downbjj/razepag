@@ -2,15 +2,15 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package*.json tsconfig*.json ./
 COPY prisma ./prisma
 
 RUN npm install
 
-COPY . .
+COPY src ./src
 
-# Usa o caminho explícito do nest CLI para evitar problemas de PATH
-RUN ./node_modules/.bin/nest build
+# Compila com tsc (sem depender do nest CLI)
+RUN npm run build
 
 # ─── Produção ────────────────────────────────────────────────
 FROM node:20-alpine AS production
@@ -34,4 +34,4 @@ COPY --from=builder /app/dist ./dist
 EXPOSE 3001
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "./node_modules/.bin/prisma db push --schema=prisma/schema.prisma && node dist/src/main"]
+CMD ["sh", "-c", "./node_modules/.bin/prisma db push --schema=prisma/schema.prisma && node dist/src/main.js"]
