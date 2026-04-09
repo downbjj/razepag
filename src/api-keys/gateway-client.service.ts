@@ -222,9 +222,10 @@ export class GatewayClientService {
     if (!secretValid) return null;
 
     // IP whitelist check — if empty, allow all IPs
-    if (client.allowedIps.length > 0) {
+    const allowedIps = Array.isArray(client.allowedIps) ? client.allowedIps as string[] : [];
+    if (allowedIps.length > 0) {
       const normalised = this.normaliseIp(requestIp);
-      const allowed = client.allowedIps.some(ip => this.normaliseIp(ip) === normalised);
+      const allowed = allowedIps.some(ip => this.normaliseIp(ip) === normalised);
       if (!allowed) {
         this.logger.warn(`IP ${requestIp} not in whitelist for client ${clientId}`);
         return null;

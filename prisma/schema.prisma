@@ -8,7 +8,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "mysql"
   url      = env("DATABASE_URL")
 }
 
@@ -95,7 +95,7 @@ model User {
   totalWithdrawn Decimal @default(0) @db.Decimal(20, 2)
 
   // Gateway — token MP armazenado com criptografia AES-256
-  mercadoPagoAccessToken String?
+  mercadoPagoAccessToken String? @db.Text
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -198,7 +198,7 @@ model WebhookConfig {
   userId   String
   user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   url      String
-  events   String[]
+  events   Json
   isActive Boolean  @default(true)
   secret   String   // HMAC-SHA256 secret
 
@@ -498,7 +498,7 @@ model ApiClient {
   clientId     String   @unique
   clientSecret String   // bcrypt hash — nunca retornar após criação
   name         String
-  allowedIps   String[] @default([])
+  allowedIps   Json     @default("[]")
   isActive     Boolean  @default(true)
   userId       String
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)

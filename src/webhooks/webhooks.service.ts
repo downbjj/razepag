@@ -78,9 +78,10 @@ export class WebhooksService {
   }
 
   async triggerWebhook(userId: string, event: string, payload: any, transactionId?: string) {
-    const webhooks = await this.prisma.webhookConfig.findMany({
-      where: { userId, isActive: true, events: { has: event } },
+    const allWebhooks = await this.prisma.webhookConfig.findMany({
+      where: { userId, isActive: true },
     });
+    const webhooks = allWebhooks.filter(w => (w.events as string[]).includes(event));
 
     for (const webhook of webhooks) {
       const logId = uuidv4();

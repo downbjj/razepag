@@ -31,4 +31,4 @@ COPY --from=builder /app/dist ./dist
 EXPOSE 3001
 
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["sh", "-c", "npx prisma migrate deploy --schema=prisma/schema.prisma && node dist/src/main"]
+CMD ["sh", "-c", "npx prisma db push --schema=prisma/schema.prisma && node dist/src/main"]
