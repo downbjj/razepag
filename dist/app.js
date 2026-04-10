@@ -10,6 +10,7 @@ var dbSafe = dbUrl.replace(/:([^@]+)@/, ':***@');
 console.log('[app] NODE_ENV =', process.env.NODE_ENV);
 console.log('[app] PORT     =', process.env.PORT);
 console.log('[app] DATABASE =', dbSafe);
+console.log('[app] DB_START =', dbUrl.substring(0, 8)); // should print "mysql://"
 
 if (!process.env.DATABASE_URL) {
   console.error('[app] FATAL: DATABASE_URL is not set.');
