@@ -32,6 +32,8 @@ async function bootstrap() {
     origin: [
       configService.get<string>('FRONTEND_URL', 'http://localhost:3000'),
       'http://localhost:3000',
+      'https://razepag.com',
+      'https://www.razepag.com',
       'https://razepague.com',
       'https://www.razepague.com',
     ],
