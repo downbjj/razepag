@@ -75,7 +75,7 @@ async function bootstrap() {
     logger.log(`Swagger docs available at: http://localhost:${port}/api/docs`);
   }
 
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0');
   logger.log(`RazePague running on port ${port} [${nodeEnv}]`);
 }
 
