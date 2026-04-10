@@ -17,7 +17,7 @@ async function bootstrap() {
   });
 
   const configService = app.get(ConfigService);
-  const port = configService.get<number>('PORT', 3001);
+  const port = Number(process.env.PORT) || configService.get<number>('PORT') || 3001;
   const nodeEnv = configService.get<string>('NODE_ENV', 'development');
 
   // Security
