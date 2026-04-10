@@ -21,7 +21,7 @@ require('reflect-metadata');
 // Run prisma db push to ensure all tables exist
 try {
   console.log('[app] Running prisma db push...');
-  execSync('./node_modules/.bin/prisma db push --accept-data-loss --skip-generate', {
+  execSync('node ./node_modules/prisma/build/index.js db push --accept-data-loss --skip-generate', {
     cwd:     root,
     stdio:   'inherit',
     timeout: 120000,
