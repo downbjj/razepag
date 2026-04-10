@@ -153,7 +153,7 @@ export class MercadoPagoProvider {
 
     try {
       const results = await this.payment.search({
-        options: { filters: { external_reference: externalId }, limit: 1 },
+        options: { external_reference: externalId as any, limit: 1 },
       });
       const payment = results?.results?.[0];
       return (payment as any)?.status || 'pending';
