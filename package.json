@@ -7,7 +7,7 @@
     "build": "tsc -p tsconfig.build.json || true",
     "start": "node dist/main.js",
     "start:dev": "ts-node -r tsconfig-paths/register src/main.ts",
-    "start:prod": "node dist/main.js",
+    "start:prod": "prisma db push && node dist/main.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
