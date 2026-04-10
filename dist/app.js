@@ -16,7 +16,7 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-require('reflect-metadata');
+require(path.join(root, 'node_modules', 'reflect-metadata'));
 
 // Run prisma db push to ensure all tables exist
 try {
