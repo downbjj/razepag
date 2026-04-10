@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import axios, { AxiosInstance } from 'axios';
+import { MercadoPagoConfig, Payment, PaymentSearch } from 'mercadopago';
 
 export interface CreatePixChargeParams {
   externalId: string;
@@ -12,7 +12,7 @@ export interface CreatePixChargeParams {
 }
 
 export interface PixChargeResult {
-  id: string;        // MP numeric payment ID
+  id: string;
   status: string;
   qrCode: string;
   copyPaste: string;
@@ -28,9 +28,9 @@ export interface PixTransferParams {
 
 export interface MPPayment {
   id: number;
-  status: string;                 // 'approved' | 'pending' | 'rejected' | 'cancelled' | 'in_process'
+  status: string;
   status_detail: string;
-  external_reference: string;     // our UUID (externalId)
+  external_reference: string;
   transaction_amount: number;
   date_approved: string | null;
   date_created: string;
@@ -46,27 +46,27 @@ export interface MPPayment {
 @Injectable()
 export class MercadoPagoProvider {
   private readonly logger = new Logger(MercadoPagoProvider.name);
-  private client: AxiosInstance;
-  private readonly accessToken: string;
+  private payment: Payment;
+  private paymentSearch: PaymentSearch;
   private readonly isMock: boolean;
 
   constructor(private configService: ConfigService) {
-    this.accessToken = this.configService.get<string>('MERCADO_PAGO_ACCESS_TOKEN', '');
+    const accessToken = this.configService.get<string>('MERCADO_PAGO_ACCESS_TOKEN', '');
+
     this.isMock =
-      !this.accessToken ||
-      this.accessToken.startsWith('mock') ||
-      this.accessToken === 'YOUR_MP_TOKEN';
+      !accessToken ||
+      accessToken.startsWith('mock') ||
+      accessToken === 'seu_access_token_mp' ||
+      accessToken === 'YOUR_MP_TOKEN';
 
     if (!this.isMock) {
-      this.client = axios.create({
-        baseURL: 'https://api.mercadopago.com',
-        headers: {
-          Authorization: `Bearer ${this.accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 30000,
+      const client = new MercadoPagoConfig({
+        accessToken,
+        options: { timeout: 30000 },
       });
-      this.logger.log('Mercado Pago provider initialized [production]');
+      this.payment = new Payment(client);
+      this.paymentSearch = new PaymentSearch(client);
+      this.logger.log('Mercado Pago SDK initialized [production]');
     } else {
       this.logger.warn('Mercado Pago token not configured — running in MOCK mode');
     }
@@ -74,7 +74,6 @@ export class MercadoPagoProvider {
 
   // ─────────────────────────────────────────────────────────────────────────
   // CRIAR COBRANÇA PIX
-  // Retorna o payment ID do MP + QR Code
   // ─────────────────────────────────────────────────────────────────────────
   async createPixCharge(params: CreatePixChargeParams): Promise<PixChargeResult> {
     if (this.isMock) return this.mockCreatePixCharge(params);
@@ -82,12 +81,12 @@ export class MercadoPagoProvider {
     try {
       const expirationDate = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
-      const payload: any = {
+      const body: any = {
         transaction_amount: params.amount,
         description:        params.description,
         payment_method_id:  'pix',
         date_of_expiration: expirationDate,
-        external_reference: params.externalId,   // nosso UUID — usado para lookup no webhook
+        external_reference: params.externalId,
         payer: {
           email:      params.customerEmail,
           first_name: params.customerName.split(' ')[0],
@@ -97,22 +96,22 @@ export class MercadoPagoProvider {
 
       if (params.customerDocument) {
         const doc = params.customerDocument.replace(/\D/g, '');
-        payload.payer.identification = {
+        body.payer.identification = {
           type:   doc.length === 11 ? 'CPF' : 'CNPJ',
           number: doc,
         };
       }
 
-      const response = await this.client.post('/v1/payments', payload, {
-        headers: { 'X-Idempotency-Key': params.externalId },
+      const result = await this.payment.create({
+        body,
+        requestOptions: { idempotencyKey: params.externalId },
       });
 
-      const payment = response.data as MPPayment;
-      const qrData  = payment.point_of_interaction?.transaction_data;
+      const qrData = result.point_of_interaction?.transaction_data;
 
       return {
-        id:        String(payment.id),
-        status:    payment.status,
+        id:        String(result.id),
+        status:    result.status || 'pending',
         qrCode:    qrData?.qr_code_base64
           ? `data:image/png;base64,${qrData.qr_code_base64}`
           : await this.generateQrCodeBase64(qrData?.qr_code || ''),
@@ -120,64 +119,62 @@ export class MercadoPagoProvider {
         expiresAt: expirationDate,
       };
     } catch (error) {
-      const mpError =
-        error.response?.data?.message ||
-        error.response?.data?.cause?.[0]?.description ||
-        error.message;
-      this.logger.error('createPixCharge error:', mpError);
-      throw new BadRequestException(`Erro ao criar cobrança PIX: ${mpError}`);
+      const msg =
+        error?.cause?.[0]?.description ||
+        error?.message ||
+        'Erro desconhecido';
+      this.logger.error('createPixCharge error:', msg);
+      throw new BadRequestException(`Erro ao criar cobrança PIX: ${msg}`);
     }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // CONSULTAR PAGAMENTO POR ID (usado no webhook e no polling)
-  // SEMPRE consulta a API — NUNCA confia no body do webhook
+  // CONSULTAR PAGAMENTO POR ID
   // ─────────────────────────────────────────────────────────────────────────
   async getPayment(mpPaymentId: string | number): Promise<MPPayment | null> {
     if (this.isMock) return null;
 
     try {
-      const response = await this.client.get(`/v1/payments/${mpPaymentId}`);
-      return response.data as MPPayment;
+      const result = await this.payment.get({ id: String(mpPaymentId) });
+      return result as unknown as MPPayment;
     } catch (error) {
-      this.logger.error(`getPayment(${mpPaymentId}) error:`, error.message);
+      this.logger.error(`getPayment(${mpPaymentId}) error:`, error?.message);
       return null;
     }
   }
 
-  // Alias para compatibilidade
   async getPaymentById(mpPaymentId: string): Promise<MPPayment | null> {
     return this.getPayment(mpPaymentId);
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // CONSULTAR STATUS POR external_reference (polling)
+  // CONSULTAR STATUS POR external_reference (polling de fallback)
   // ─────────────────────────────────────────────────────────────────────────
   async getPaymentStatus(externalId: string): Promise<string> {
     if (this.isMock) return 'pending';
 
     try {
-      const response = await this.client.get('/v1/payments/search', {
-        params: { external_reference: externalId, limit: 1 },
+      const results = await this.paymentSearch.search({
+        options: { external_reference: externalId, limit: 1 },
       });
-      const payment = response.data?.results?.[0];
-      return payment?.status || 'pending';
+      const payment = results?.results?.[0];
+      return (payment as any)?.status || 'pending';
     } catch (error) {
-      this.logger.error('getPaymentStatus error:', error.message);
+      this.logger.error('getPaymentStatus error:', error?.message);
       return 'pending';
     }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // ENVIAR TRANSFERÊNCIA PIX (saque para chave externa)
+  // ENVIAR PIX (saque — requer aprovação especial do MP para PJ)
   // ─────────────────────────────────────────────────────────────────────────
   async sendPixTransfer(params: PixTransferParams): Promise<{ id: string; status: string }> {
     if (this.isMock) {
       return { id: `mock_transfer_${params.externalId}`, status: 'pending' };
     }
-    // Mercado Pago não oferece envio de PIX via API pública para PJ sem aprovação especial.
-    // Por ora, registra para processamento manual.
-    this.logger.warn(`PIX transfer pending manual processing: ${params.externalId} → ${params.pixKey} R$${params.amount}`);
+    this.logger.warn(
+      `PIX transfer pending manual processing: ${params.externalId} → ${params.pixKey} R$${params.amount}`,
+    );
     return { id: `mp_transfer_${params.externalId}`, status: 'pending' };
   }
 
@@ -185,11 +182,9 @@ export class MercadoPagoProvider {
   // MOCK
   // ─────────────────────────────────────────────────────────────────────────
   private async mockCreatePixCharge(params: CreatePixChargeParams): Promise<PixChargeResult> {
-    const mockId = `mp_mock_${Date.now()}`;
     const mockPayload = `00020126580014br.gov.bcb.pix0136${params.externalId.slice(0, 36)}5204000053039865802BR5913${params.customerName.substring(0, 13).padEnd(13)}6009SAO PAULO62070503***6304ABCD`;
-
     return {
-      id:        mockId,
+      id:        `mp_mock_${Date.now()}`,
       status:    'pending',
       qrCode:    await this.generateQrCodeBase64(mockPayload),
       copyPaste: mockPayload,
