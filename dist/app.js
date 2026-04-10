@@ -1,30 +1,43 @@
 'use strict';
-var path = require('path');
-var fs   = require('fs');
-var root = path.join(__dirname, '..');
+var path     = require('path');
+var fs       = require('fs');
+var execSync = require('child_process').execSync;
+var root     = path.join(__dirname, '..');
+
+// Log DATABASE_URL (hide password) to confirm env vars are loaded
+var dbUrl  = process.env.DATABASE_URL || 'NOT SET';
+var dbSafe = dbUrl.replace(/:([^@]+)@/, ':***@');
+console.log('[app] NODE_ENV =', process.env.NODE_ENV);
+console.log('[app] PORT     =', process.env.PORT);
+console.log('[app] DATABASE =', dbSafe);
+
+if (!process.env.DATABASE_URL) {
+  console.error('[app] FATAL: DATABASE_URL is not set.');
+  process.exit(1);
+}
 
 require('reflect-metadata');
 
-// Run prisma db push before starting the app
+// Run prisma db push to ensure all tables exist
 try {
-  var execSync = require('child_process').execSync;
   console.log('[app] Running prisma db push...');
-  execSync('npx prisma db push --accept-data-loss --skip-generate', {
-    cwd: root,
-    stdio: 'inherit',
-    timeout: 60000,
+  execSync('./node_modules/.bin/prisma db push --accept-data-loss --skip-generate', {
+    cwd:     root,
+    stdio:   'inherit',
+    timeout: 120000,
+    env:     Object.assign({}, process.env),
   });
-  console.log('[app] prisma db push done.');
+  console.log('[app] Tables ready.');
 } catch (e) {
   console.error('[app] prisma db push failed:', e.message);
-  // Continue anyway — tables may already exist
 }
 
 var mainJs = path.join(__dirname, 'main.js');
-
 if (fs.existsSync(mainJs)) {
+  console.log('[app] Loading dist/main.js');
   require(mainJs);
 } else {
+  console.log('[app] dist/main.js not found — using ts-node');
   require('ts-node').register({
     project:       path.join(root, 'tsconfig.json'),
     transpileOnly: true,
