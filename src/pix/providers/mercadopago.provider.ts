@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { MercadoPagoConfig, Payment, PaymentSearch } from 'mercadopago';
+import { MercadoPagoConfig, Payment } from 'mercadopago';
 
 export interface CreatePixChargeParams {
   externalId: string;
@@ -47,7 +47,6 @@ export interface MPPayment {
 export class MercadoPagoProvider {
   private readonly logger = new Logger(MercadoPagoProvider.name);
   private payment: Payment;
-  private paymentSearch: PaymentSearch;
   private readonly isMock: boolean;
 
   constructor(private configService: ConfigService) {
@@ -65,7 +64,6 @@ export class MercadoPagoProvider {
         options: { timeout: 30000 },
       });
       this.payment = new Payment(client);
-      this.paymentSearch = new PaymentSearch(client);
       this.logger.log('Mercado Pago SDK initialized [production]');
     } else {
       this.logger.warn('Mercado Pago token not configured — running in MOCK mode');
@@ -154,8 +152,8 @@ export class MercadoPagoProvider {
     if (this.isMock) return 'pending';
 
     try {
-      const results = await this.paymentSearch.search({
-        options: { external_reference: externalId, limit: 1 },
+      const results = await this.payment.search({
+        options: { filters: { external_reference: externalId }, limit: 1 },
       });
       const payment = results?.results?.[0];
       return (payment as any)?.status || 'pending';
