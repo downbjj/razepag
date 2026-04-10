@@ -4,10 +4,10 @@
   "description": "Payment Gateway Backend - NestJS",
   "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.build.json || true && echo \"require('reflect-metadata'); require('./main.js');\" > dist/app.js",
-    "start": "node app.js",
+    "build": "tsc -p tsconfig.build.json || true",
+    "start": "node dist/main.js",
     "start:dev": "ts-node -r tsconfig-paths/register src/main.ts",
-    "start:prod": "node app.js",
+    "start:prod": "node dist/main.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
